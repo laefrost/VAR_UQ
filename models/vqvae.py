@@ -58,8 +58,11 @@ class VQVAE(nn.Module):
         f_hat, usages, vq_loss = self.quantize(self.quant_conv(self.encoder(inp)), ret_usages=ret_usages)
         return self.decoder(self.post_quant_conv(f_hat)), usages, vq_loss
     # ===================== `forward` is only used in VAE training =====================
-    
     def fhat_to_img(self, f_hat: torch.Tensor):
+        print("after post quant conv")
+        print(self.post_quant_conv(f_hat).shape)
+        print("after decoder")
+        print(self.decoder(self.post_quant_conv(f_hat)).shape)
         return self.decoder(self.post_quant_conv(f_hat)).clamp_(-1, 1)
     
     def img_to_idxBl(self, inp_img_no_grad: torch.Tensor, v_patch_nums: Optional[Sequence[Union[int, Tuple[int, int]]]] = None) -> List[torch.LongTensor]:    # return List[Bl]

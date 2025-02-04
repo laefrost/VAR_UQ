@@ -63,8 +63,11 @@ class VARTrainer(object):
             inp_B3HW = inp_B3HW.to(dist.get_device(), non_blocking=True)
             label_B = label_B.to(dist.get_device(), non_blocking=True)
             
+            # true indeces for all token maps
             gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(inp_B3HW)
+            # flattens indices into one sequence 
             gt_BL = torch.cat(gt_idx_Bl, dim=1)
+            # teacherforcing input for var
             x_BLCv_wo_first_l: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl)
             
             self.var_wo_ddp.forward

@@ -103,7 +103,6 @@ class VectorQuantizer2(nn.Module):
         else: usages = None
         return f_hat, usages, mean_vq_loss
     # ===================== `forward` is only used in VAE training =====================
-    
     def embed_to_fhat(self, ms_h_BChw: List[torch.Tensor], all_to_max_scale=True, last_one=False) -> Union[List[torch.Tensor], torch.Tensor]:
         ls_f_hat_BChw = []
         B = ms_h_BChw[0].shape[0]
@@ -133,6 +132,8 @@ class VectorQuantizer2(nn.Module):
         return ls_f_hat_BChw
     
     def f_to_idxBl_or_fhat(self, f_BChw: torch.Tensor, to_fhat: bool, v_patch_nums: Optional[Sequence[Union[int, Tuple[int, int]]]] = None) -> List[Union[torch.Tensor, torch.LongTensor]]:  # z_BChw is the feature from inp_img_no_grad
+        print("f_to_idxBl_or_fhat ------------------------------------------")
+        
         B, C, H, W = f_BChw.shape
         f_no_grad = f_BChw.detach()
         f_rest = f_no_grad.clone()
@@ -155,8 +156,13 @@ class VectorQuantizer2(nn.Module):
                 d_no_grad = torch.sum(z_NC.square(), dim=1, keepdim=True) + torch.sum(self.embedding.weight.data.square(), dim=1, keepdim=False)
                 d_no_grad.addmm_(z_NC, self.embedding.weight.data.T, alpha=-2, beta=1)  # (B*h*w, vocab_size)
                 idx_N = torch.argmin(d_no_grad, dim=1)
+                smallest_values, _ = torch.topk(d_no_grad, 5, dim=1, largest=False)
+                #print(smallest_values)
+            #print("indx_N------------------------")
+            #print(idx_N.shape)
             
             idx_Bhw = idx_N.view(B, ph, pw)
+            #print(idx_Bhw.shape)
             h_BChw = F.interpolate(self.embedding(idx_Bhw).permute(0, 3, 1, 2), size=(H, W), mode='bicubic').contiguous() if (si != SN-1) else self.embedding(idx_Bhw).permute(0, 3, 1, 2).contiguous()
             h_BChw = self.quant_resi[si/(SN-1)](h_BChw)
             f_hat.add_(h_BChw)

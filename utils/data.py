@@ -22,13 +22,13 @@ def build_cal_dataset(data_path: str, final_reso: int, mid_reso=1.125,):
     
     # build dataset
     val_set = DatasetFolder(root=osp.join(data_path, 'val'), loader=pil_loader, extensions=IMG_EXTENSIONS, transform=val_aug)
-    val_set_subset = torch.utils.data.Subset(val_set, np.random.choice(len(val_set), 10, replace=False))
+    #val_set_subset = torch.utils.data.Subset(val_set, np.random.choice(len(val_set), 10, replace=False))
     # TODO: prob not correct
     num_classes = 1000
-    print(f'[Dataset] {len(val_set_subset)=}, {num_classes=}')
+    print(f'[Dataset] {len(val_set)=}, {num_classes=}')
     print_aug(val_aug, '[val]')
     
-    return num_classes, val_set_subset    
+    return num_classes, val_set    
 
 
 def build_dataset(
