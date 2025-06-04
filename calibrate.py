@@ -9,7 +9,7 @@ setattr(torch.nn.LayerNorm, 'reset_parameters', lambda self: None)  # disable de
 from models import VQVAE, build_vae_var
 import dist
 from utils import arg_util, misc
-from utils.data import build_cal_dataset
+from utils.data_cal import build_cal_dataset
 from utils.data_sampler import DistInfiniteBatchSampler, EvalDistributedSampler
 from utils.misc import auto_resume
 from calibrator import VARCalibrator
@@ -40,14 +40,15 @@ def load_model(num_classes, depth, args: arg_util.Args):
 
     # build vae, var
     patch_nums = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)
+    #patch_nums = (1, 2, 3, 4, 6, 9, 13, 18, 24, 32)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     if 'vae' not in globals() or 'var' not in globals():
         vae, var = build_vae_var(
             V=4096, Cvae=32, ch=160, share_quant_resi=4,    # hard-coded VQVAE hyperparameters
             device=device, patch_nums=patch_nums,
-            num_classes=1000, depth=depth, shared_aln=False,
-        )
+            num_classes=1000, depth=depth, shared_aln= False,
 
+        )
     # load checkpoints
     vae.load_state_dict(torch.load(vae_ckpt, map_location='cpu'), strict=True)
     var.load_state_dict(torch.load(var_ckpt, map_location='cpu'), strict=True)
@@ -72,24 +73,24 @@ def load_cal_data(args: arg_util.Args):
 
     types = str((type(dataset_val).__name__))
     
-    ld_val = DataLoader(
-        dataset_val, num_workers=0, pin_memory=True,
-        batch_size=round(args.batch_size*1.5), 
-        sampler=EvalDistributedSampler(dataset_val, num_replicas=dist.get_world_size(), rank=dist.get_rank()),
-        shuffle=False, drop_last=False,
-    )
-    del dataset_val
-    
     print(f'[dataloader multi processing] ...', end='', flush=True)
     stt = time.time()
     # noinspection PyArgumentList
     print(f'     [dataloader multi processing](*) finished! ({time.time()-stt:.2f}s)')
     print(f'[dataloader] gbs={args.glb_batch_size}, lbs={args.batch_size}, types(tr, va)={types}')
     
-    return num_classes, ld_val
+    return num_classes, dataset_val
 
 def build_everything(args: arg_util.Args, depth): 
-    num_classes, ld_val = load_cal_data(args)
+    num_classes, dataset_val = load_cal_data(args)
+    
+    ld_val = DataLoader(
+            dataset_val, num_workers=0, pin_memory=True,
+            batch_size= args.bs_calib, #round(args.batch_size*1.5),
+            shuffle=True, drop_last=False
+        )
+    del dataset_val
+    
     var_wo_ddp, vae_local = load_model(num_classes, depth, args)
         
     calibrator = VARCalibrator(device=args.device, patch_nums=args.patch_nums, resos=args.resos,
@@ -100,19 +101,14 @@ def build_everything(args: arg_util.Args, depth):
     
     
 def main_calibrating():
+    torch.cuda.empty_cache()
     MODEL_DEPTH = 16
     args: arg_util.Args = arg_util.init_dist_and_get_args()
     calibrator, ld_val = build_everything(args, MODEL_DEPTH) 
-    #if args.calibration_mode == 'teacher_forced':
-
-    # 1-alpha: desired coverage level
-    calibrator.teacher_enforced_cp(ld_val=ld_val, cp_type='conformal_cr', alpha=0.1)
-    #print(calibrator.qhats)
-    #calibrator.var_wo_ddp.qhats = torch.FloatTensor(calibrator.qhats)
-    #print(calibrator.var_wo_ddp.qhats)
+    calibrator.teacher_enforced_cp(ld_val=ld_val, cp_type=args.cp_type, alpha=args.alpha, autoregressive=args.autoregressive)
         
-    vae_ckpt = 'vae_ch160v4096z32_calib.pth'
-    var_ckpt = f'var_d{MODEL_DEPTH}_calib.pth'
+    vae_ckpt = 'vae_ch160v4096z32_calib_60.pth'
+    var_ckpt = f'var_d{MODEL_DEPTH}_calib_60.pth'
 
     torch.save(calibrator.vae_local.state_dict(), vae_ckpt)
     torch.save(calibrator.var_wo_ddp.state_dict(), var_ckpt)
