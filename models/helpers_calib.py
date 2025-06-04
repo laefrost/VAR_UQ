@@ -33,7 +33,10 @@ def generate_high_uq_samples(uq_classes: torch.Tensor, idx_Bl: torch.Tensor, ind
     expanded_indcs[:, index_uq] = uq_classes
     return expanded_indcs
 
-
+# Minimizing the entropy is somewhat tricky since, by definition the min. values of the entropy 
+# are probably gonna be on the vertices of the feasible set. However, these aren't in the solution to 
+# the classical optimization algorithms. Thus, the idea is recursivley find the most concentrated distribution under the constraint 
+# tau (and thus by the resepctive qhat). 
 def min_entropy(x, tau, n_max, n_min): 
     x = np.sort(x)
     x_max = x[-n_max:]
@@ -61,10 +64,15 @@ def min_entropy(x, tau, n_max, n_min):
         print('solver failed')
         return(1)
     if problem.status in ["optimal", "optimal_inaccurate"]:
-        return problem.value / np.log(4096)
+        pi_opt = pi.value 
+        eps = 1e-15
+        positive_idx = (pi_opt > 0)
+        pi_pos = pi_opt[positive_idx]
+        entropy = -np.sum(pi_pos * np.log(pi_pos))
+        return entropy / np.log(4096)
     else:
         print("No optimal solution found.")
-        return(1)
+        # recursive strategy for restricting the 
         if (n_max == 2): 
             return(1)
         if(n_max + n_min >= 4096 and n_max == 4096):
@@ -104,7 +112,7 @@ def calc_entropy(x, tau, maximize):
         return max_entropy_problem.value / np.log(4096) #, lambda_k.value
     else: 
         if (x <= tau).any(): 
-            # degenerate distribution p
+            # degenerate distribution p present
             return 0
         else: 
             return(min_entropy(x, tau=tau, n_max=1, n_min=1))
