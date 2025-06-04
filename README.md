@@ -11,7 +11,8 @@ https://github.com/FoundationVision/VAR
       eprint={2404.02905},
       archivePrefix={arXiv},
       primaryClass={cs.CV}
-}```
+}
+```
 
 For the theory behind the approach please refer to: 
 https://arxiv.org/abs/2411.04852
