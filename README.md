@@ -19,11 +19,11 @@ https://arxiv.org/abs/2411.04852
 
 ## Structure of the Repo: 
 1) Calibration triggered via: `calibrating.py`
-   1.1) Different types of calibration techniques can be submitted as calibration parameter
-2) Calibration executed in: `calibrator.py`
-3) Functions for generating conformal prediction sets in: `models/var.py`
-   3.1) Specific function for generating images with CPS/CCR (depending on the type of calibration of the calibrated model): 
-4) Helper functions for e.g. calculating the upper/lower entropy can be found in `models/helpers_calib.py`
-5) Example on how to use a calibrated model in `demo_calibrate.ipynb`
+      - Different types of calibration techniques can be submitted as calibration parameter
+3) Calibration executed in: `calibrator.py`
+4) Functions for generating conformal prediction sets in: `models/var.py`
+      - Specific function for generating images with CPS/CCR (depending on the type of calibration of the calibrated model): 
+5) Helper functions for e.g. calculating the upper/lower entropy can be found in `models/helpers_calib.py`
+6) Example on how to use a calibrated model in `demo_calibrate.ipynb`
 
 Newly created/modified files in the context of this seminar: `calibrating.py`, `calibrator.py`, `models/var.py`, `models/vqvae.py`, `models/quant.py`, `models/__init__.py`, `demo_calibrate.ipynb`, `utils/args_util.py`, `utils/data.py`
