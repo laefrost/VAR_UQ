@@ -110,6 +110,13 @@ class Args(Tap):
     tf32: bool = True       # whether to use TensorFloat32
     device: str = 'cpu'     # [automatically set; don't specify this]
     seed: int = None        # seed
+    
+    # calib stuff 
+    bs_calib : int = None
+    cp_type : int = None
+    autoregressive : bool = False
+    alpha : float = 0.1
+    
     def seed_everything(self, benchmark: bool):
         torch.backends.cudnn.enabled = True
         torch.backends.cudnn.benchmark = benchmark
@@ -281,4 +288,9 @@ def init_dist_and_get_args():
     )
     args.tb_log_dir_path = os.path.join(args.local_out_dir_path, tb_name)
     
+    # add calibration args
+    args.bs_calib = args.bs_calib
+    args.cp_type = args.cp_type
+    args.autoregressive = args.autoregressive
+    args.alpha = args.alpha
     return args
