@@ -13,7 +13,7 @@ https://github.com/FoundationVision/VAR
       archivePrefix={arXiv},
       primaryClass={cs.CV}
 }
-´´´´ 
+´´´
 For the theory behind the approach please refer to: 
 https://arxiv.org/abs/2411.04852
 
