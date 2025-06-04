@@ -11,9 +11,10 @@ from models.basic_var import AdaLNBeforeHead, AdaLNSelfAttn
 from models.helpers import gumbel_softmax_with_rng, sample_with_top_k_top_p_
 from models.vqvae import VQVAE, VectorQuantizer2
 from torch.autograd.functional import jacobian
-from utils.helper_calib import stochastic_simplex_sampling
+from models.helpers_calib import calc_entropy, sample_from_high_uq, generate_high_uq_samples, sample_from_prediction_set, calc_quadratic_entropy
 import scipy
-
+import torch.nn.functional as F
+import numpy as np
 
 
 class SharedAdaLin(nn.Linear):
@@ -29,7 +30,7 @@ class VAR(nn.Module):
         norm_eps=1e-6, shared_aln=False, cond_drop_rate=0.1,
         attn_l2_norm=False,
         patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),   # 10 steps by default
-        flash_if_available=True, fused_if_available=True, cp_type = "global_vanilla_cp", alpha = 0.1, qhats = None
+        flash_if_available=True, fused_if_available=True, alpha = None, qhats = None, cp_type = None, cal_scores = None
     ):
         super().__init__()
         # 0. hyperparameters
@@ -122,12 +123,13 @@ class VAR(nn.Module):
         self.head = nn.Linear(self.C, self.V)
         
         # 7. conformal prediction stuff
-        self.cp_type = cp_type
         self.register_buffer('qhats', None if qhats is None else torch.FloatTensor(qhats), persistent=True)
+        self.register_buffer('cp_type', None if cp_type is None else torch.FloatTensor(cp_type), persistent=True)
+        self.register_buffer('alpha', None if alpha is None else torch.FloatTensor(alpha), persistent=True)
         self.cp_count_sets = []
-        self.alpha = alpha
-        self.cfg = 1.5 # TODO: Maybe delete this
-    
+        self.register_buffer('cal_scores', None if cal_scores is None else torch.FloatTensor(cal_scores), persistent=True)
+        self.cfg = 1.5 
+        
     def get_logits(self, h_or_h_and_residual: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], cond_BD: Optional[torch.Tensor]):
         if not isinstance(h_or_h_and_residual, torch.Tensor):
             h, resi = h_or_h_and_residual   # fused_add_norm must be used
@@ -136,11 +138,283 @@ class VAR(nn.Module):
             h = h_or_h_and_residual
         return self.head(self.head_nm(h.float(), cond_BD).float()).float()
     
-    #@torch.no_grad()
-    def autoregressive_infer_cfg(
+    def get_prediction_sets(self, si, begin, end, logits_BlV, rng, top_k, top_p, num_samples=1, distances = None): 
+        qhats = self.qhats[begin:end] # shape begin:end
+        qhats = qhats.view(1, qhats.shape[0], 1) # shape: 1, l, 1
+        softmax_BlV = logits_BlV.softmax(dim=-1) #shape[B, begin:end, V]
+        count_set_l = None
+        B, L, V = softmax_BlV.shape 
+        
+        emp_entropy = - torch.sum(softmax_BlV * torch.log10(softmax_BlV), dim = -1).unsqueeze(-1)
+        emp_entropy = emp_entropy / np.log10(4096)
+        p_flat = softmax_BlV.reshape(-1, V)  # shape (B*l, V)
+
+        # Matrix multiply: (B*l, V) x (V, V) → (B*l, V)
+        dp = torch.matmul(p_flat, distances)  # each row is D @ p
+        # Elementwise product + sum over last dim: (B*l,) = sum_i p_i * [D @ p]_i
+        rao_entropy_flat = torch.sum(p_flat * dp, dim=-1)        
+        # Reshape back to (B, l)
+        rao_entropy = rao_entropy_flat.reshape(B, L).unsqueeze(-1)
+        idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0] # B, l , 1
+        idx_Bl = idx_Bl.unsqueeze(-1)
+        ratio_q_scores = None
+
+        # traditional CP with neg. prob. of true class as score function
+        if self.cp_type == 1:    
+            cal_scores = - softmax_BlV
+            mask = cal_scores <= qhats
+            count_set_l = mask.sum(dim=-1)
+            self.cp_count_sets.append(count_set_l)
+            
+        # cumulative CP
+        if self.cp_type == 2: 
+            sorted_softmax_BlV, sorted_indices = torch.sort(softmax_BlV, dim=-1, descending=True) # B, L, V
+            probs = torch.cumsum(sorted_softmax_BlV, dim=-1)  # shape B, l
+            mask = probs <= qhats
+            count_set_l = mask.sum(dim=-1) 
+            self.cp_count_sets.append(count_set_l)
+        
+        # Conformalized Credal Region with neg. prob. as score function         
+        if self.cp_type == 4: 
+            if si == len(self.patch_nums)-1:
+                # mask = softmax_BlV >= qhats
+                for b in range(softmax_BlV.shape[0]): 
+                    max_entropies = torch.zeros(size = (softmax_BlV.shape[1],)) #l entries
+                    min_entropies = torch.zeros(size = (softmax_BlV.shape[1],)) #l entries
+                    qhats = qhats.squeeze()
+                    for l in range(qhats.shape[0]): 
+                        min_entropy = calc_entropy(-softmax_BlV[b, l, :].squeeze(), tau = qhats[l], maximize = False)
+                        max_entropy = calc_entropy(-softmax_BlV[b, l, :].squeeze(), tau = qhats[l], maximize = True)
+                        
+                        max_entropies[l] = max_entropy
+                        min_entropies[l] = min_entropy
+                    if b == 0: 
+                        max_count_set_l = max_entropies.unsqueeze(0)
+                        min_count_set_l = min_entropies.unsqueeze(0)
+                    else: 
+                        max_count_set_l = torch.cat((max_count_set_l, max_entropies.unsqueeze(0)), dim = 0)
+                        min_count_set_l = torch.cat((min_count_set_l, min_entropies.unsqueeze(0)), dim = 0)
+                count_set_l = torch.cat((max_count_set_l.unsqueeze(0), min_count_set_l.unsqueeze(0)), dim = 0)
+                self.cp_count_sets.append(count_set_l)
+
+        
+        # Conformalized Credal Region eihter crisp or ambig. ground truths with scaled max_other_prob as score function
+        if self.cp_type == 6 or self.cp_type == 5: 
+            # -------------- Experimental: Only necessary for rao entropy
+            # D = self.vae_proxy[0].create_embedding_gram_matrix()
+            # eigvals = torch.linalg.eigvalsh(D)        
+            # if eigvals.min() < 0: 
+            #     A = D.cpu().numpy()
+            #     eigvals, eigvecs = np.linalg.eigh(A)
+                
+            #     # Clip negative eigenvalues
+            #     eigvals[eigvals < 0] = 0.0
+            
+            #     # Reconstruct the matrix
+            #     D = eigvecs @ np.diag(eigvals) @ eigvecs.T
+            # --------------
+            
+            # cal_scores_b = []
+            for b in range(softmax_BlV.shape[0]): 
+                max_entropies = torch.zeros(size = (softmax_BlV.shape[1],)) #l entries
+                min_entropies = torch.zeros(size = (softmax_BlV.shape[1],)) #l entries
+                qhats = qhats[0, :, 0]
+                cal_scores_l = []
+                for l in range(qhats.shape[0]): 
+                    if self.cp_type == 6: 
+                        gamma = 0.001
+                    else: 
+                        gamma = 0.00001
+                    probs = softmax_BlV[b, l, :].squeeze() # V
+                    max_values = torch.full_like(probs, float('-inf'))  # Initialize with very small values
+                    for i in range(4096):
+                        max_values[i] = torch.max(torch.cat((probs[:i], probs[i+1:])))  # Max without i-th element
+
+                    # Step 2: Compute the required ratio
+                    cal_scores = max_values / (probs + gamma) # V
+                    cal_scores_l.append(cal_scores)
+                    min_entropy = calc_entropy(cal_scores, tau = qhats[l], maximize = False)
+                    max_entropy = calc_entropy(cal_scores, tau = qhats[l], maximize = True)
+
+                    # ------ Experimental -------
+                    # Here we can also compute the shannon entropy as in type 4 ---> Rao was just experimental
+                    # min_rao_entropy = 0
+                    # max_rao_entropy = calc_quadratic_entropy(cal_scores, D, tau = qhats[l], maximize = True)
+                    max_entropies[l] = max_entropy
+                    min_entropies[l] = min_entropy
+                if b == 0: 
+                    max_count_set_l = max_entropies.unsqueeze(0)
+                    min_count_set_l = min_entropies.unsqueeze(0)
+                else: 
+                    max_count_set_l = torch.cat((max_count_set_l, max_entropies.unsqueeze(0)), dim = 0)
+                    min_count_set_l = torch.cat((min_count_set_l, min_entropies.unsqueeze(0)), dim = 0)
+                
+                # if si == len(self.patch_nums)-1: 
+                #     cal_scores_l = torch.stack(cal_scores_l, dim=0)
+                #     cal_scores_b.append(cal_scores_l)
+            
+            # count_set_l = torch.cat((max_count_set_l.unsqueeze(0), min_count_set_l.unsqueeze(0)), dim = 0)
+            count_set_l = max_count_set_l#.unsqueeze(0)
+            count_set_l_min = min_count_set_l#.unsqueeze(0)
+            self.cp_count_sets.append(count_set_l)
+            self.cp_count_sets_min.append(count_set_l_min)
+        
+        # CPS with scaled logits (shannon entropy as temperature) and cumulative score function
+        if self.cp_type == 7: 
+            log10 = torch.log10(softmax_BlV)
+            torch.nan_to_num_(log10, nan=0)
+            emp_entropy = (- torch.sum(softmax_BlV * log10, dim = -1).unsqueeze(-1)) / np.log10(4096)
+            # scale the logits:
+            logits_BlV_emp = logits_BlV / (2 * emp_entropy + 0.0000001)
+            softmax_BlV_emp = torch.softmax(logits_BlV_emp, dim = -1)
+            sorted_softmax_BlV, sorted_indices = torch.sort(softmax_BlV_emp, dim=-1, descending=True) # B, L, V
+            probs = torch.cumsum(sorted_softmax_BlV, dim=-1)  # shape B, l
+            cal_scores = probs
+            mask = probs <= qhats
+            count_set_l = mask.sum(dim=-1) 
+            self.cp_count_sets.append(count_set_l)
+        
+        # CPS with scaled logits (rao entropy as temperature) and cumulative score function
+        if self.cp_type == 8:
+            emp_entropy = - torch.sum(softmax_BlV * torch.log10(softmax_BlV), dim = -1).unsqueeze(-1)
+            emp_entropy = emp_entropy / np.log10(4096)
+            p_flat = softmax_BlV.reshape(-1, V)  # shape (B*l, V)
+
+            # Matrix multiply: (B*l, V) x (V, V) → (B*l, V)
+            dp = torch.matmul(p_flat, distances)  # each row is D @ p
+            # Elementwise product + sum over last dim: (B*l,) = sum_i p_i * [D @ p]_i
+            rao_entropy_flat = torch.sum(p_flat * dp, dim=-1)
+            rao_entropy = rao_entropy_flat.reshape(B, L).unsqueeze(-1)            
+            logits_BlV_emp = logits_BlV * rao_entropy
+
+            softmax_BlV_emp = torch.softmax(logits_BlV_emp, dim = -1)
+            sorted_softmax_BlV, sorted_indices = torch.sort(softmax_BlV_emp, dim=-1, descending=True) # B, L, V
+            probs = torch.cumsum(sorted_softmax_BlV, dim=-1)  # shape B, l
+            cal_scores = probs
+            mask = probs <= qhats            
+            #idx_Bl = sample_from_prediction_set(logits_BlV, mask=mask, rng=rng, num_samples=1)[:, :, 0]
+            #idx_Bl = idx_Bl.unsqueeze(-1)
+            
+            count_set_l = mask.sum(dim=-1) 
+            self.cp_count_sets.append(count_set_l)
+            position_in_sorted = (sorted_indices == idx_Bl).nonzero(as_tuple=True)[-1].unsqueeze(-1).unsqueeze(0)
+            scores_idxBl = torch.gather(probs, dim=-1, index=position_in_sorted) 
+        
+         # CPS Experimental: Scale the Logits based on expected distance per class --> similar approach to entropy weighting   
+        if self.cp_type == 9: 
+            p_flat = softmax_BlV.reshape(-1, V)  # shape (B*L, V)
+            # Matrix multiply to get expected distances per class: (B*L, V) @ (V, V^T)
+            distance_prob_flat = torch.matmul(p_flat, distances)  # shape (B*L, V)
+            # Reshape back to (B, L, V)
+            distance_prob = distance_prob_flat.reshape(B, L, V)
+            
+            logits_BlV_scaled = logits_BlV/distance_prob
+            softmax_BlV_scaled = torch.softmax(logits_BlV_scaled, dim = -1)
+            
+            max_values, _ = softmax_BlV_scaled.max(dim=-1, keepdim=True)  # Shape: (B, L, 1)
+            # Create a mask for elements that are equal to the max
+            mask = softmax_BlV_scaled == max_values  # Shape: (B, L, V)
+
+            # Replace max values with -inf temporarily to get second max
+            X_masked = softmax_BlV_scaled.clone()
+            X_masked[mask] = float('-inf')
+            second_max_values, _ = X_masked.max(dim=-1, keepdim = True)  # Shape: (B, L)
+            max_excluding_self = torch.where(mask, second_max_values, max_values)
+                                
+            gamma = 0.00001
+            a = max_excluding_self / (softmax_BlV + gamma)
+            mask = a <= qhats
+            count_set_l = mask.sum(dim=-1) 
+            self.cp_count_sets.append(count_set_l)
+        
+        # CPS Experimental: Scale the Logits based on max. distance from other classes    
+        if self.cp_type == 10: 
+            emp_entropy = - torch.sum(softmax_BlV * torch.log10(softmax_BlV), dim = -1).unsqueeze(-1)
+            emp_entropy = emp_entropy / np.log10(4096)
+            p_flat = softmax_BlV.reshape(-1, V)  # shape (B*l, V)
+
+            # Matrix multiply: (B*l, V) x (V, V) → (B*l, V)
+            dp = torch.matmul(p_flat, distances)  # each row is D @ p
+
+            # Elementwise product + sum over last dim: (B*l,) = sum_i p_i * [D @ p]_i
+            rao_entropy_flat = torch.sum(p_flat * dp, dim=-1)
+            # Reshape back to (B, l)
+            rao_entropy = rao_entropy_flat.reshape(B, L).unsqueeze(-1)
+            
+            distance_prob_flat = torch.matmul(p_flat, distances)
+            distance_prob = distance_prob_flat.reshape(B, L, V)
+            max_dist, _ = distance_prob.max(dim = -1, keepdim = True)
+            dist_entropy = torch.sum(softmax_BlV * (max_dist), dim = -1).unsqueeze(-1) 
+            logits_BlV_emp = logits_BlV / dist_entropy                
+            softmax_BlV_emp = torch.softmax(logits_BlV_emp, dim = -1)
+            max_values, _ = softmax_BlV_emp.max(dim=-1, keepdim=True)  # Shape: (B, L, 1)
+            mask = softmax_BlV_emp == max_values  # Shape: (B, L, V)
+
+            X_masked = softmax_BlV_emp.clone()
+            X_masked[mask] = float('-inf')
+            second_max_values, _ = X_masked.max(dim=-1, keepdim = True)  # Shape: (B, L)
+            max_excluding_self = torch.where(mask, second_max_values, max_values)
+                                
+            gamma = 0.00001
+            a = max_excluding_self / (softmax_BlV + gamma)
+            mask = a <= qhats
+            count_set_l = mask.sum(dim=-1) 
+            self.cp_count_sets.append(count_set_l)
+                        
+            # additional analysis on
+            from scipy.cluster.hierarchy import linkage, fcluster
+            from scipy.spatial.distance import squareform
+            distances.fill_diagonal_(0)
+            condensed_dist = squareform(distances)
+
+            # Perform hierarchical/agglomerative clustering
+            Z = linkage(condensed_dist, method='average')
+            clusters = fcluster(Z, t=150, criterion='maxclust')
+            clusters = torch.from_numpy(clusters)
+            masked_clusters = clusters.unsqueeze(0).unsqueeze(0) * mask  # (1, 1, V) broadcast#
+            unique_counts = torch.stack([
+            torch.tensor([len(torch.unique(v)) for v in mat])
+            for mat in masked_clusters])
+            self.cluster_count_sets.append(unique_counts)
+            
+        # CPS Experimental: Scale scores based on entropy of top-k logits    
+        if self.cp_type == 3: 
+            _, topk_idxs = distances.topk(1000, dim=-1, largest=False) # V , k           
+            count_set_l = torch.empty((B, L), device=softmax_BlV.device)
+            
+            for b in range(B): 
+                for l in range(L):
+                    classes = list()
+                    for v in range(V): 
+                        mask = torch.zeros(V).bool()
+                        mask.scatter_(dim=-1, index=topk_idxs[v, :], value=True)
+                        softmax_bl = softmax_BlV[b, l, :] * mask # shape: 1, 1, V
+                        #print(softmax_bl.shape)
+                        #print(torch.count_nonzero(softmax_bl, dim = -1))
+                        
+                        softmax_bl_sorted, sorted_indices = torch.sort(softmax_bl, dim=-1, descending=True) # 1,1, V  
+                        probs = torch.cumsum(softmax_bl_sorted, dim=-1)  # shape B, l
+                        #print("probs", probs.shape)
+                        
+                        mask = probs <= qhats[0, l, 0]
+                        mask.squeeze_()
+                        
+                        if sorted_indices[mask].shape[0] >= 1000: 
+                            classes = classes + topk_idxs[v, :]
+                        else: 
+                            classes = classes + sorted_indices[mask].shape[0]
+                         
+                    count_set_l[b, l] =  torch.unique(classes).shape[0]                             
+            self.cp_count_sets.append(count_set_l)
+             
+        return count_set_l, idx_Bl.squeeze(-1), None
+        
+    
+    @torch.no_grad()
+    def autoregressive_infer_and_uq(
         self, B: int, label_B: Optional[Union[int, torch.LongTensor]],
-        g_seed: Optional[int] = None, cfg=1.5, top_k=0, top_p=0.0,
-        more_smooth=False, calc_pred_sets = False, 
+        g_seed: Optional[int] = None, cfg=4, top_k=0, top_p=0.0,
+        more_smooth=False, calc_pred_sets = False, generate_maps = False, input_img_tokens = None, edit_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:   # returns reconstructed image (B, 3, H, W) in [0, 1]
         """
         only used for inference, on autoregressive mode
@@ -162,12 +436,20 @@ class VAR(nn.Module):
             label_B = torch.full((B,), fill_value=self.num_classes if label_B < 0 else label_B, device=self.lvl_1L.device)
         
         sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))
+        
+        #sos = cond_BD = self.class_emb(label_B)
             
         lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
         next_token_map = sos.unsqueeze(1).expand(2 * B, self.first_l, -1) + self.pos_start.expand(2 * B, self.first_l, -1) + lvl_pos[:, :self.first_l]        
         cur_L = 0
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
+        self.cp_count_sets = []
+        self.cluster_count_sets = []
         
+        distances = self.vae_proxy[0].create_embedding_distances()
+        
+        if calc_pred_sets and (self.cp_type == 5 or self.cp_type == 6):
+            self.cp_count_sets_min = []
         for b in self.blocks: b.attn.kv_caching(True)
         for si, pn in enumerate(self.patch_nums):   # si: i-th segment
             ratio = si / self.num_stages_minus_1
@@ -179,68 +461,18 @@ class VAR(nn.Module):
             AdaLNSelfAttn.forward
             for b in self.blocks:
                 x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
-            
-            # TODO: 
             logits_BlV = self.get_logits(x, cond_BD)
-            
-            #  TODO: Maybe adapt this            
-            t = self.cfg * ratio
+                        
+            t = cfg * ratio
             logits_BlV = (1+t) * logits_BlV[:B] - t * logits_BlV[B:]
             
             begin = self.begin_ends[si][0]
             end = self.begin_ends[si][1]
             
-            # if calc_pred_sets: 
-            #     # change this
-            #     qhats = self.qhats[begin:end] # shape begin:end
-            #     qhats = qhats.view(1, qhats.shape[0], 1)
-            #     #qhat = self.qhats[si]
-            #     #print(f"1-qhat: {len(qhats)}")
-            #     softmax_BlV = logits_BlV.softmax(dim=-1) #shape[B, begin:end, V]
-            #     #print(softmax_BlV.shape)
-            #     mask = softmax_BlV >= (1-qhats)
-                
-            #     # max_values, _ = softmax_BlV.max(dim=2)
-            #     #print("Max values along the last dimension (V):", max_values)
-                
-            #     #prediction_set_l = softmax_BlV[mask]
-            #     count_set_l = mask.sum(dim=2)
-            #     #print(prediction_set_l.shape)            
-            #     #self.prediction_sets.append(prediction_set_l)
-            #     self.cp_count_sets.append(count_set_l)
-            if si == len(self.patch_nums)-1:
-                print(si)
-                # get sampled lambdas
-                qhats = self.qhats[begin:end] # shape begin:end
-                qhats = qhats.view(1, qhats.shape[0], 1)
-                lambdas = stochastic_simplex_sampling(logits_BlV.shape[-1], 100) # shape [100, V]
-                
-                print(lambdas.shape)
-                softmax_BlV = logits_BlV.softmax(dim=-1) #shape[B, begin:end, V]
-                
-                # TODO: Compute ws distance per element in lambdas and sofmax blv --> output 100, L, V 
-                # for each b, compute ws distance between all lambdas and the resepctive L, V  
-                # mask = ws >= 1- qhats
-                B, L, V = softmax_BlV.shape
-                for b in range(B): 
-                    print(b)
-                    for l in range(L): 
-                        probs = softmax_BlV[b, l].cpu().numpy() # shape: l, v
-                        for la in lambdas: 
-                            ws = scipy.stats.wasserstein_distance(range(V), range(V), la , probs) 
-                        
-                #mask = softmax_BlV >= (1-qhats)
-                
-                # max_values, _ = softmax_BlV.max(dim=2)
-                # print("Max values along the last dimension (V):", max_values)
-                
-                #prediction_set_l = softmax_BlV[mask]
-                #count_set_l = mask.sum(dim=2)
-                #print(prediction_set_l.shape)            
-                #self.prediction_sets.append(prediction_set_l)
-                #self.cp_count_sets.append(count_set_l)
+            if calc_pred_sets: 
+                count_set_l, idx_Bl, ratio_q_scores = self.get_prediction_sets(si, begin, end, logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1, distances=distances)
+                last_count_set = count_set_l
             
-            idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
             if not more_smooth: # this is the default case
                 # embedding of the class indices
                 h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)   # B, l, Cvae
@@ -248,110 +480,88 @@ class VAR(nn.Module):
                 gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)   # refer to mask-git
                 h_BChw = gumbel_softmax_with_rng(logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
             
-            #print('idx_Bl')
-            #print(idx_Bl.shape)
-            #print('h_BChw')
-            #print(h_BChw.shape)
             h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
-            #print(h_BChw.shape)
+            
+            if edit_mask is not None:
+                gt_BChw = self.vae_quant_proxy[0].embedding(input_img_tokens[si]).transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
+                h_BChw = self.replace_embedding(edit_mask, h_BChw, gt_BChw, pn, pn)
+            
+            f_hat_old = f_hat
             f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
-            #print(f_hat.shape)
-            #print(next_token_map.shape)
             if si != self.num_stages_minus_1:   # prepare for next stage
                 next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
                 next_token_map = self.word_embed(next_token_map) + lvl_pos[:, cur_L:cur_L + self.patch_nums[si+1] ** 2]
                 next_token_map = next_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG
         
         for b in self.blocks: b.attn.kv_caching(False)
-        #print("FHAT2")
-        #print(f_hat.shape)
-        # torch.Size([5, 32, 16, 16]) --> input to fhat_to_image
-        #print("Count set")
-        #print(count_set_l.shape)
-        #uq_mask = self.select_high_uncertainty_embeddings(count_set_l, 5)
-        #print(uq_mask)
-        grads = None 
-        #grads = self.compute_pixelwise_jacobian(f_hat_old, idx_Bl)
-        return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5), grads   # de-normalize, from [-1, 1] to [0, 1]
-    
-    def jacobian_model(self, h_BChw, f_hat):
-        B = h_BChw.shape[0]
-        h_BChw = h_BChw.transpose(1, 2).reshape(B, self.Cvae, 16, 16) # shape : (B, 32, 16, 16])
-        #h_BChw = h_BChw.clone().detach().requires_grad_(True)
-        print("Before quant_resi: ", h_BChw.requires_grad, h_BChw.grad_fn)
-        h = self.vae_quant_proxy[0].quant_resi[int(9/(10-1))](h_BChw)
-        print("After quant_resi: ", h.requires_grad, h.grad_fn)
-        f_hat = f_hat + h
-        output = self.vae_proxy[0].fhat_to_img(f_hat)  # Output shape: (B, 1, 256, 256)
         
-        # ----------------------------------------------------------------
-        assert h_BChw.requires_grad, "h_BChw is not tracking gradients!"
-        assert f_hat.requires_grad, "f_hat does not require gradients!"
-        assert output.requires_grad, "Output does not require gradients!"
-        return output 
-        
-
-    def compute_pixelwise_jacobian(self, f_hat, idx_Bl):
-        print("Compute jacobian")
-        B, L = idx_Bl.shape  # Latent space (B, 256) 
-        idx_Bl = idx_Bl.clone().detach()
-        
-        h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl) # shape: B, 256, 32
-        h_BChw = h_BChw.requires_grad_(True)
-        
-        def model_wrapper(h):
-            return self.jacobian_model(h, f_hat)
-    
-        jacobian_matrix = jacobian(model_wrapper, h_BChw, vectorize=True)
-        jacobian_matrix = jacobian_matrix.detach()
-        return jacobian_matrix
-        
-        # expanded_mask = mask.expand(B, 32, 16, 16)  # Shape: (B, 32, 16, 16)
-        # print(mask.shape)
-        # print(expanded_mask.shape)
-        # print(expanded_mask)
-
-        # # Use masked_select to extract only the selected embeddings
-        # h_selected = h_BChw[expanded_mask]  # Flattened tensor
-        # print("h selected")
-        # print(h_selected.shape)
-         
-        # Initialize Jacobian storage
-        # jacobian = torch.zeros(B, self.Cvae, 16, 16, 256, 256).to(h_BChw.device)  # (B, 256, 256, 256)
-        # print("f hat ", f_hat.requires_grad, f_hat.grad_fn)
-        # print("Output ", output.requires_grad, output.grad_fn)
-        # num_samples = 10  # Reduce computation
-        # sampled_pixels = torch.randint(0, 256, (num_samples, 2))  # Random (x, y) pairs
-
-        # for idx in range(num_samples):
-        #     print(idx)
-        #     x, y = sampled_pixels[idx]
-
-        #     grad_outputs = torch.zeros_like(output, requires_grad=True).clone()
-        #     grad_outputs[:, :, x, y] = 1  # Isolate gradient for one output pixel
+        if edit_mask is not None and calc_pred_sets: 
+            em = edit_mask.view(-1, edit_mask.shape[0]*edit_mask.shape[1]) > 0
+            last_count_set[em] = 0 
+            #print("last_count_set")
+            #print(last_count_set)
             
-        #     # Compute gradient of f(x,y) w.r.t. latent space (16x16)
-        #     grads = torch.autograd.grad(outputs=output, inputs=h_BChw,
-        #                                 grad_outputs=grad_outputs,
-        #                                 create_graph=True, retain_graph=True)[0]  # Shape: (B, 16, 16)
-        #     print(grads.shape)
-
-        #     jacobian[:, :, :, :, x, y] = grads  # Store the gradients
-
-        #return jacobian  # Shape: (B, 16, 16, 256, 256)
+        if generate_maps and calc_pred_sets: 
+            map_mean, map_var = self.generate_variance_maps(count_set_l=last_count_set, idx_l=idx_Bl, logits_BlV=logits_BlV, pn=pn, si=si, f_hat=f_hat_old)
+            #other_map, other_map_var = self.generate_variance_maps(ratio_q_scores, idx_l=idx_Bl, logits_BlV=logits_BlV, pn=pn, si=si, f_hat=f_hat_old)
+            oter_map, other_map_var = None, None
+        else: 
+            map_mean, map_var, other_map, other_map_var =None, None, None, None
+        
+        if calc_pred_sets and (self.cp_type == 5 or self.cp_type == 6):
+           self.cp_count_sets = [self.cp_count_sets, self.cp_count_sets_min]
+        
+        return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5), other_map_var, map_var, self.cp_count_sets, last_count_set, self.cluster_count_sets
+    
+    
+    
+    def generate_variance_maps(self, count_set_l, idx_l, logits_BlV, pn, si, f_hat):
+        means = list()
+        vars = list()
+        uq_mask = self.select_high_uncertainty_embeddings(count_set_l, 4)[0, :].squeeze() #shape(L) of first element
+        # get index i of High UQ postition
+        indcs_uq = uq_mask.nonzero(as_tuple=True)[0]
+        for idx_uq in indcs_uq.numpy():         
+            # print(f"idx_uq: {idx_uq}")
+            #mask_high_uq  = mask[0, idx_uq, :] # get mask at i, should be 1, 1, V or sth
+            #print(f"mask_high_uq: {mask_high_uq.sum()}")
+            logits_V = logits_BlV[0, idx_uq, :]
+            # print(f"logitsV: {logits_V}")
+            samples_uq = sample_from_high_uq(logits_V=logits_V.squeeze())#, mask=mask_high_uq.squeeze())
+            B = samples_uq.shape[0]
+            f_hat = f_hat[0, :]
+            f_hat = f_hat.unsqueeze(0).expand(B, -1, -1, -1).clone()
+            new_idx_Bl = generate_high_uq_samples(samples_uq, idx_Bl=idx_l[0, :], index_uq=idx_uq)
+            
+            h_BChw = self.vae_quant_proxy[0].embedding(new_idx_Bl)
+            h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
+            f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
+            
+            imgs = self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5) # B, C, h, w, 
+            
+            mean_L = imgs.mean(dim=0)  # Shape: (L,)
+            var_L = imgs.var(dim=0, unbiased=False) 
+            
+            mean_L = mean_L.mean(dim = 0)
+            var_L = var_L.mean(dim = 0)
+            
+            means.append(mean_L)
+            vars.append(var_L)
+        
+        return means, vars
+    
+    def replace_embedding(self, edit_mask: torch.Tensor, h_BChw: torch.Tensor, gt_BChw: torch.Tensor, ph: int, pw: int) -> torch.Tensor:
+        B = h_BChw.shape[0]
+        h, w = edit_mask.shape[-2:]
+        if edit_mask.ndim == 2:
+            edit_mask = edit_mask.unsqueeze(0).expand(B, h, w)
+        
+        force_gt_B1hw = F.interpolate(edit_mask.unsqueeze(1).to(dtype=torch.float, device=gt_BChw.device), size=(ph, pw), mode='bilinear', align_corners=False).gt(0.5).int()
+        if ph * pw <= 3: force_gt_B1hw.fill_(1)
+        return gt_BChw * force_gt_B1hw + h_BChw * (1 - force_gt_B1hw)
     
     
     def select_high_uncertainty_embeddings(self, uncertainty_map, top_k=5):
-        """
-        Selects the top-k uncertain latent embeddings and returns a mask of shape [B, 1, 16, 16].
-
-        Args:
-            uncertainty_map: Tensor of shape [B, 256] containing uncertainty values.
-            top_k: Number of highest-uncertainty embeddings to select.
-
-        Returns:
-            mask: Binary mask of shape [B, 1, 16, 16] where selected positions are True.
-        """
         B, L = uncertainty_map.shape  # (B, 256)
         assert L == 256, "Expected 256 latent embeddings per batch."
 
@@ -359,18 +569,16 @@ class VAR(nn.Module):
         topk_indices = torch.topk(uncertainty_map, k=top_k, dim=1)[1]  # (B, top_k)
 
         # Compute (h, w) positions for the 16x16 spatial grid
-        h = topk_indices // 16  # Compute row indices (B, top_k)
-        w = topk_indices % 16   # Compute column indices (B, top_k)
+        #h = topk_indices // 16  # Compute row indices (B, top_k)
+        #w = topk_indices % 16   # Compute column indices (B, top_k)
 
         # Create an empty mask (B, 1, 16, 16)
-        mask = torch.zeros(B, 1, 16, 16, dtype=torch.bool, device=uncertainty_map.device)
+        mask = torch.zeros(B, 256, dtype=torch.bool, device=uncertainty_map.device)
 
         # Use advanced indexing to set selected positions to True
-        mask[torch.arange(B).unsqueeze(1), 0, h, w] = True  # Vectorized assignment
-
+        mask[torch.arange(B).unsqueeze(1), topk_indices] = True  # Vectorized assignment
+        #mask = mask.view(-1, 256)
         return mask  # Shape: (B, 1, 16, 16)
-
-    
     
     
     def forward(self, label_B: torch.LongTensor, x_BLCv_wo_first_l: torch.Tensor) -> torch.Tensor:  # returns logits_BLV

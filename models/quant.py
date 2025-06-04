@@ -132,15 +132,13 @@ class VectorQuantizer2(nn.Module):
         return ls_f_hat_BChw
     
     def f_to_idxBl_or_fhat(self, f_BChw: torch.Tensor, to_fhat: bool, v_patch_nums: Optional[Sequence[Union[int, Tuple[int, int]]]] = None) -> List[Union[torch.Tensor, torch.LongTensor]]:  # z_BChw is the feature from inp_img_no_grad
-        print("f_to_idxBl_or_fhat ------------------------------------------")
-        
+        # Note: we don't use znorm
         B, C, H, W = f_BChw.shape
         f_no_grad = f_BChw.detach()
         f_rest = f_no_grad.clone()
         f_hat = torch.zeros_like(f_rest)
         
         f_hat_or_idx_Bl: List[torch.Tensor] = []
-        
         patch_hws = [(pn, pn) if isinstance(pn, int) else (pn[0], pn[1]) for pn in (v_patch_nums or self.v_patch_nums)]    # from small to large
         assert patch_hws[-1][0] == H and patch_hws[-1][1] == W, f'{patch_hws[-1]=} != ({H=}, {W=})'
         
@@ -157,12 +155,8 @@ class VectorQuantizer2(nn.Module):
                 d_no_grad.addmm_(z_NC, self.embedding.weight.data.T, alpha=-2, beta=1)  # (B*h*w, vocab_size)
                 idx_N = torch.argmin(d_no_grad, dim=1)
                 smallest_values, _ = torch.topk(d_no_grad, 5, dim=1, largest=False)
-                #print(smallest_values)
-            #print("indx_N------------------------")
-            #print(idx_N.shape)
             
             idx_Bhw = idx_N.view(B, ph, pw)
-            #print(idx_Bhw.shape)
             h_BChw = F.interpolate(self.embedding(idx_Bhw).permute(0, 3, 1, 2), size=(H, W), mode='bicubic').contiguous() if (si != SN-1) else self.embedding(idx_Bhw).permute(0, 3, 1, 2).contiguous()
             h_BChw = self.quant_resi[si/(SN-1)](h_BChw)
             f_hat.add_(h_BChw)
@@ -200,6 +194,50 @@ class VectorQuantizer2(nn.Module):
             h = self.quant_resi[si/(SN-1)](h_BChw)
             f_hat.add_(h)
             return f_hat, f_hat
+    
+    def f_to_distances(self, f_BChw: torch.Tensor, v_patch_nums: Optional[Sequence[Union[int, Tuple[int, int]]]] = None) -> List[Union[torch.Tensor, torch.LongTensor]]:  # z_BChw is the feature from inp_img_no_grad
+        print("In f_to_idxBl_or_fhat")
+        # Note: we don't use znorm
+        B, C, H, W = f_BChw.shape
+        f_no_grad = f_BChw.detach()
+        f_rest = f_no_grad.clone()
+        f_hat = torch.zeros_like(f_rest)
+        
+        f_hat_or_idx_Bl: List[torch.Tensor] = []
+        
+        patch_hws = [(pn, pn) if isinstance(pn, int) else (pn[0], pn[1]) for pn in (v_patch_nums or self.v_patch_nums)]    # from small to large
+        assert patch_hws[-1][0] == H and patch_hws[-1][1] == W, f'{patch_hws[-1]=} != ({H=}, {W=})'
+        
+        SN = len(patch_hws)
+        for si, (ph, pw) in enumerate(patch_hws): # from small to large
+            if 0 <= self.prog_si < si: break    # progressive training: not supported yet, prog_si always -1
+            # find the nearest embedding
+            z_NC = F.interpolate(f_rest, size=(ph, pw), mode='area').permute(0, 2, 3, 1).reshape(-1, C) if (si != SN-1) else f_rest.permute(0, 2, 3, 1).reshape(-1, C)
+            # calcualte euclidian distance
+            d_no_grad = torch.sum(z_NC.square(), dim=1, keepdim=True) + torch.sum(self.embedding.weight.data.square(), dim=1, keepdim=False)
+            d_no_grad.addmm_(z_NC, self.embedding.weight.data.T, alpha=-2, beta=1)  # (B*h*w, vocab_size)
+            # TODO: Insert Vecotor B, l, V with probs in V --> return both the Vector and idx_N
+            V = d_no_grad.shape[1]
+            print(V)
+            idx_N = torch.argmin(d_no_grad, dim=1)
+            smallest_values, _ = torch.topk(d_no_grad, 5, dim=1, largest=False)
+            # h_BChw = F.interpolate(self.embedding(idx_Bhw).permute(0, 3, 1, 2), size=(H, W), mode='bicubic').contiguous() if (si != SN-1) else self.embedding(idx_Bhw).permute(0, 3, 1, 2).contiguous()
+            # h_BChw = self.quant_resi[si/(SN-1)](h_BChw)
+            # f_hat.add_(h_BChw)
+            # f_rest.sub_(h_BChw)
+            # f_hat_or_idx_Bl.append(idx_N.reshape(B, ph*pw))
+            f_hat_or_idx_Bl.append(d_no_grad.reshape(B, ph*pw, V))
+            
+        # print("indx_N------------------------")
+        # print(idx_N.shape) # B * 
+        # print(f" d_no_grad: {d_no_grad.shape}")
+
+        # idx_Bhw = idx_N.view(B, ph, pw)
+        # print(idx_N.shape)
+        # print(idx_Bhw.shape)
+        
+        return f_hat_or_idx_Bl 
+        
 
 
 class Phi(nn.Conv2d):

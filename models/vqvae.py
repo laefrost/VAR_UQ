@@ -59,10 +59,6 @@ class VQVAE(nn.Module):
         return self.decoder(self.post_quant_conv(f_hat)), usages, vq_loss
     # ===================== `forward` is only used in VAE training =====================
     def fhat_to_img(self, f_hat: torch.Tensor):
-        print("after post quant conv")
-        print(self.post_quant_conv(f_hat).shape)
-        print("after decoder")
-        print(self.decoder(self.post_quant_conv(f_hat)).shape)
         return self.decoder(self.post_quant_conv(f_hat)).clamp_(-1, 1)
     
     def img_to_idxBl(self, inp_img_no_grad: torch.Tensor, v_patch_nums: Optional[Sequence[Union[int, Tuple[int, int]]]] = None) -> List[torch.LongTensor]:    # return List[Bl]
@@ -96,3 +92,21 @@ class VQVAE(nn.Module):
         if 'quantize.ema_vocab_hit_SV' in state_dict and state_dict['quantize.ema_vocab_hit_SV'].shape[0] != self.quantize.ema_vocab_hit_SV.shape[0]:
             state_dict['quantize.ema_vocab_hit_SV'] = self.quantize.ema_vocab_hit_SV
         return super().load_state_dict(state_dict=state_dict, strict=strict, assign=assign)
+    
+    def image_to_distances(self, inp_img_no_grad: torch.Tensor, v_patch_nums: Optional[Sequence[Union[int, Tuple[int, int]]]] = None) -> List[torch.LongTensor]:    # return List[Bl]
+        f = self.quant_conv(self.encoder(inp_img_no_grad))
+        return self.quantize.f_to_distances(f, v_patch_nums=v_patch_nums) 
+    
+    def create_embedding_distances(self):
+        print("Embeddding shapes ", self.quantize.embedding.weight.data.shape)
+        embeddings_normalized = torch.nn.functional.normalize(self.quantize.embedding.weight.data, p=2, dim=1)
+        cosine_similarity= torch.mm(embeddings_normalized, embeddings_normalized.T)
+        cosine_distance = 1 - cosine_similarity
+        return cosine_distance  
+        
+    def create_embedding_gram_matrix(self): 
+        gamma = 1.0 / self.quantize.embedding.weight.data.shape[1]
+        X_norm = torch.sum(self.quantize.embedding.weight.data ** 2, dim=1).view(-1, 1)
+        sq_dists = X_norm + X_norm.T - 2.0 * torch.mm(self.quantize.embedding.weight.data, self.quantize.embedding.weight.data.T)
+        K = torch.exp(-gamma * sq_dists)
+        return K
