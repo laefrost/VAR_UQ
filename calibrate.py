@@ -107,8 +107,8 @@ def main_calibrating():
     calibrator, ld_val = build_everything(args, MODEL_DEPTH) 
     calibrator.teacher_enforced_cp(ld_val=ld_val, cp_type=args.cp_type, alpha=args.alpha, autoregressive=args.autoregressive)
         
-    vae_ckpt = 'vae_ch160v4096z32_calib_60.pth'
-    var_ckpt = f'var_d{MODEL_DEPTH}_calib_60.pth'
+    vae_ckpt = 'vae_ch160v4096z32_calib_test.pth'
+    var_ckpt = f'var_d{MODEL_DEPTH}_calib_test.pth'
 
     torch.save(calibrator.vae_local.state_dict(), vae_ckpt)
     torch.save(calibrator.var_wo_ddp.state_dict(), var_ckpt)

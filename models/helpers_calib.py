@@ -62,7 +62,7 @@ def min_entropy(x, tau, n_max, n_min):
         problem.solve()
     except:
         print('solver failed')
-        return(1)
+        return(-1)
     if problem.status in ["optimal", "optimal_inaccurate"]:
         pi_opt = pi.value 
         eps = 1e-15
@@ -72,11 +72,11 @@ def min_entropy(x, tau, n_max, n_min):
         return entropy / np.log(4096)
     else:
         print("No optimal solution found.")
-        # recursive strategy for restricting the 
+        # set n_max due to computational issues
         if (n_max == 2): 
-            return(1)
+            return(-1)
         if(n_max + n_min >= 4096 and n_max == 4096):
-            return(1)
+            return(-1)
         if n_max + n_min == 4096: 
             n_max += n_max
             n_min = 1

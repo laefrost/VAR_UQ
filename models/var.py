@@ -176,26 +176,30 @@ class VAR(nn.Module):
         
         # Conformalized Credal Region with neg. prob. as score function         
         if self.cp_type == 4: 
-            if si == len(self.patch_nums)-1:
-                # mask = softmax_BlV >= qhats
-                for b in range(softmax_BlV.shape[0]): 
-                    max_entropies = torch.zeros(size = (softmax_BlV.shape[1],)) #l entries
-                    min_entropies = torch.zeros(size = (softmax_BlV.shape[1],)) #l entries
-                    qhats = qhats.squeeze()
-                    for l in range(qhats.shape[0]): 
-                        min_entropy = calc_entropy(-softmax_BlV[b, l, :].squeeze(), tau = qhats[l], maximize = False)
-                        max_entropy = calc_entropy(-softmax_BlV[b, l, :].squeeze(), tau = qhats[l], maximize = True)
-                        
-                        max_entropies[l] = max_entropy
-                        min_entropies[l] = min_entropy
-                    if b == 0: 
-                        max_count_set_l = max_entropies.unsqueeze(0)
-                        min_count_set_l = min_entropies.unsqueeze(0)
-                    else: 
-                        max_count_set_l = torch.cat((max_count_set_l, max_entropies.unsqueeze(0)), dim = 0)
-                        min_count_set_l = torch.cat((min_count_set_l, min_entropies.unsqueeze(0)), dim = 0)
-                count_set_l = torch.cat((max_count_set_l.unsqueeze(0), min_count_set_l.unsqueeze(0)), dim = 0)
-                self.cp_count_sets.append(count_set_l)
+            # mask = softmax_BlV >= qhats
+            for b in range(softmax_BlV.shape[0]): 
+                max_entropies = torch.zeros(size = (softmax_BlV.shape[1],)) #l entries
+                min_entropies = torch.zeros(size = (softmax_BlV.shape[1],)) #l entries
+                # qhats = qhats.squeeze()
+                qhats = qhats[0, :, 0]
+                for l in range(qhats.shape[0]): 
+                    min_entropy = calc_entropy(-softmax_BlV[b, l, :].squeeze(), tau = qhats[l], maximize = False)
+                    max_entropy = calc_entropy(-softmax_BlV[b, l, :].squeeze(), tau = qhats[l], maximize = True)
+                    
+                    max_entropies[l] = max_entropy
+                    min_entropies[l] = min_entropy
+                if b == 0: 
+                    max_count_set_l = max_entropies.unsqueeze(0)
+                    min_count_set_l = min_entropies.unsqueeze(0)
+                else: 
+                    max_count_set_l = torch.cat((max_count_set_l, max_entropies.unsqueeze(0)), dim = 0)
+                    min_count_set_l = torch.cat((min_count_set_l, min_entropies.unsqueeze(0)), dim = 0)
+            #count_set_l = torch.cat((max_count_set_l.unsqueeze(0), min_count_set_l.unsqueeze(0)), dim = 0)
+            #self.cp_count_sets.append(count_set_l)
+            count_set_l = max_count_set_l#.unsqueeze(0)
+            count_set_l_min = min_count_set_l#.unsqueeze(0)
+            self.cp_count_sets.append(count_set_l)
+            self.cp_count_sets_min.append(count_set_l_min)
 
         
         # Conformalized Credal Region eihter crisp or ambig. ground truths with scaled max_other_prob as score function
@@ -285,7 +289,7 @@ class VAR(nn.Module):
             # Elementwise product + sum over last dim: (B*l,) = sum_i p_i * [D @ p]_i
             rao_entropy_flat = torch.sum(p_flat * dp, dim=-1)
             rao_entropy = rao_entropy_flat.reshape(B, L).unsqueeze(-1)            
-            logits_BlV_emp = logits_BlV * rao_entropy
+            logits_BlV_emp = logits_BlV / rao_entropy
 
             softmax_BlV_emp = torch.softmax(logits_BlV_emp, dim = -1)
             sorted_softmax_BlV, sorted_indices = torch.sort(softmax_BlV_emp, dim=-1, descending=True) # B, L, V
@@ -300,7 +304,8 @@ class VAR(nn.Module):
             position_in_sorted = (sorted_indices == idx_Bl).nonzero(as_tuple=True)[-1].unsqueeze(-1).unsqueeze(0)
             scores_idxBl = torch.gather(probs, dim=-1, index=position_in_sorted) 
         
-         # CPS Experimental: Scale the Logits based on expected distance per class --> similar approach to entropy weighting   
+         # CPS Experimental: Scale the Logits based on expected distance per class --> similar approach to entropy weighting 
+         # Intuition: The farer apart the most likely classes the smoother the softmax --> higher uncertainty    
         if self.cp_type == 9: 
             p_flat = softmax_BlV.reshape(-1, V)  # shape (B*L, V)
             # Matrix multiply to get expected distances per class: (B*L, V) @ (V, V^T)
@@ -327,19 +332,15 @@ class VAR(nn.Module):
             count_set_l = mask.sum(dim=-1) 
             self.cp_count_sets.append(count_set_l)
         
-        # CPS Experimental: Scale the Logits based on max. distance from other classes    
+        # CPS Experimental: Scale the Logits based on max. expected distance from other classes
+        # Intuition: The farer apart the most likely classes the smoother the softmax --> higher uncertainty    
         if self.cp_type == 10: 
-            emp_entropy = - torch.sum(softmax_BlV * torch.log10(softmax_BlV), dim = -1).unsqueeze(-1)
-            emp_entropy = emp_entropy / np.log10(4096)
             p_flat = softmax_BlV.reshape(-1, V)  # shape (B*l, V)
-
-            # Matrix multiply: (B*l, V) x (V, V) → (B*l, V)
-            dp = torch.matmul(p_flat, distances)  # each row is D @ p
-
-            # Elementwise product + sum over last dim: (B*l,) = sum_i p_i * [D @ p]_i
-            rao_entropy_flat = torch.sum(p_flat * dp, dim=-1)
-            # Reshape back to (B, l)
-            rao_entropy = rao_entropy_flat.reshape(B, L).unsqueeze(-1)
+            # # Matrix multiply: (B*l, V) x (V, V) → (B*l, V)
+            # dp = torch.matmul(p_flat, distances)  # each row is D @ p
+            # # Elementwise product + sum over last dim: (B*l,) = sum_i p_i * [D @ p]_i
+            # rao_entropy_flat = torch.sum(p_flat * dp, dim=-1)
+            # rao_entropy = rao_entropy_flat.reshape(B, L).unsqueeze(-1)
             
             distance_prob_flat = torch.matmul(p_flat, distances)
             distance_prob = distance_prob_flat.reshape(B, L, V)
@@ -361,13 +362,11 @@ class VAR(nn.Module):
             count_set_l = mask.sum(dim=-1) 
             self.cp_count_sets.append(count_set_l)
                         
-            # additional analysis on
+            # additional analysis on how similar the elements in the prediciton sets actually are
             from scipy.cluster.hierarchy import linkage, fcluster
             from scipy.spatial.distance import squareform
             distances.fill_diagonal_(0)
             condensed_dist = squareform(distances)
-
-            # Perform hierarchical/agglomerative clustering
             Z = linkage(condensed_dist, method='average')
             clusters = fcluster(Z, t=150, criterion='maxclust')
             clusters = torch.from_numpy(clusters)
@@ -378,34 +377,34 @@ class VAR(nn.Module):
             self.cluster_count_sets.append(unique_counts)
             
         # CPS Experimental: Scale scores based on entropy of top-k logits    
-        if self.cp_type == 3: 
-            _, topk_idxs = distances.topk(1000, dim=-1, largest=False) # V , k           
-            count_set_l = torch.empty((B, L), device=softmax_BlV.device)
+        # if self.cp_type == 3: 
+        #     _, topk_idxs = distances.topk(1000, dim=-1, largest=False) # V , k           
+        #     count_set_l = torch.empty((B, L), device=softmax_BlV.device)
             
-            for b in range(B): 
-                for l in range(L):
-                    classes = list()
-                    for v in range(V): 
-                        mask = torch.zeros(V).bool()
-                        mask.scatter_(dim=-1, index=topk_idxs[v, :], value=True)
-                        softmax_bl = softmax_BlV[b, l, :] * mask # shape: 1, 1, V
-                        #print(softmax_bl.shape)
-                        #print(torch.count_nonzero(softmax_bl, dim = -1))
+        #     for b in range(B): 
+        #         for l in range(L):
+        #             classes = list()
+        #             for v in range(V): 
+        #                 mask = torch.zeros(V).bool()
+        #                 mask.scatter_(dim=-1, index=topk_idxs[v, :], value=True)
+        #                 softmax_bl = softmax_BlV[b, l, :] * mask # shape: 1, 1, V
+        #                 #print(softmax_bl.shape)
+        #                 #print(torch.count_nonzero(softmax_bl, dim = -1))
                         
-                        softmax_bl_sorted, sorted_indices = torch.sort(softmax_bl, dim=-1, descending=True) # 1,1, V  
-                        probs = torch.cumsum(softmax_bl_sorted, dim=-1)  # shape B, l
-                        #print("probs", probs.shape)
+        #                 softmax_bl_sorted, sorted_indices = torch.sort(softmax_bl, dim=-1, descending=True) # 1,1, V  
+        #                 probs = torch.cumsum(softmax_bl_sorted, dim=-1)  # shape B, l
+        #                 #print("probs", probs.shape)
                         
-                        mask = probs <= qhats[0, l, 0]
-                        mask.squeeze_()
+        #                 mask = probs <= qhats[0, l, 0]
+        #                 mask.squeeze_()
                         
-                        if sorted_indices[mask].shape[0] >= 1000: 
-                            classes = classes + topk_idxs[v, :]
-                        else: 
-                            classes = classes + sorted_indices[mask].shape[0]
+        #                 if sorted_indices[mask].shape[0] >= 1000: 
+        #                     classes = classes + topk_idxs[v, :]
+        #                 else: 
+        #                     classes = classes + sorted_indices[mask].shape[0]
                          
-                    count_set_l[b, l] =  torch.unique(classes).shape[0]                             
-            self.cp_count_sets.append(count_set_l)
+        #             count_set_l[b, l] =  torch.unique(classes).shape[0]                             
+        #     self.cp_count_sets.append(count_set_l)
              
         return count_set_l, idx_Bl.squeeze(-1), None
         
@@ -448,7 +447,7 @@ class VAR(nn.Module):
         
         distances = self.vae_proxy[0].create_embedding_distances()
         
-        if calc_pred_sets and (self.cp_type == 5 or self.cp_type == 6):
+        if calc_pred_sets and (self.cp_type == 5 or self.cp_type == 6 or self.cp_type == 4):
             self.cp_count_sets_min = []
         for b in self.blocks: b.attn.kv_caching(True)
         for si, pn in enumerate(self.patch_nums):   # si: i-th segment
@@ -469,6 +468,7 @@ class VAR(nn.Module):
             begin = self.begin_ends[si][0]
             end = self.begin_ends[si][1]
             
+            # get CPS or CCR
             if calc_pred_sets: 
                 count_set_l, idx_Bl, ratio_q_scores = self.get_prediction_sets(si, begin, end, logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1, distances=distances)
                 last_count_set = count_set_l
@@ -498,17 +498,15 @@ class VAR(nn.Module):
         if edit_mask is not None and calc_pred_sets: 
             em = edit_mask.view(-1, edit_mask.shape[0]*edit_mask.shape[1]) > 0
             last_count_set[em] = 0 
-            #print("last_count_set")
-            #print(last_count_set)
             
         if generate_maps and calc_pred_sets: 
             map_mean, map_var = self.generate_variance_maps(count_set_l=last_count_set, idx_l=idx_Bl, logits_BlV=logits_BlV, pn=pn, si=si, f_hat=f_hat_old)
             #other_map, other_map_var = self.generate_variance_maps(ratio_q_scores, idx_l=idx_Bl, logits_BlV=logits_BlV, pn=pn, si=si, f_hat=f_hat_old)
-            oter_map, other_map_var = None, None
+            other_map, other_map_var = None, None
         else: 
             map_mean, map_var, other_map, other_map_var =None, None, None, None
         
-        if calc_pred_sets and (self.cp_type == 5 or self.cp_type == 6):
+        if calc_pred_sets and (self.cp_type == 5 or self.cp_type == 6 or self.cp_type == 4):
            self.cp_count_sets = [self.cp_count_sets, self.cp_count_sets_min]
         
         return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5), other_map_var, map_var, self.cp_count_sets, last_count_set, self.cluster_count_sets
@@ -522,11 +520,7 @@ class VAR(nn.Module):
         # get index i of High UQ postition
         indcs_uq = uq_mask.nonzero(as_tuple=True)[0]
         for idx_uq in indcs_uq.numpy():         
-            # print(f"idx_uq: {idx_uq}")
-            #mask_high_uq  = mask[0, idx_uq, :] # get mask at i, should be 1, 1, V or sth
-            #print(f"mask_high_uq: {mask_high_uq.sum()}")
             logits_V = logits_BlV[0, idx_uq, :]
-            # print(f"logitsV: {logits_V}")
             samples_uq = sample_from_high_uq(logits_V=logits_V.squeeze())#, mask=mask_high_uq.squeeze())
             B = samples_uq.shape[0]
             f_hat = f_hat[0, :]
@@ -564,21 +558,11 @@ class VAR(nn.Module):
     def select_high_uncertainty_embeddings(self, uncertainty_map, top_k=5):
         B, L = uncertainty_map.shape  # (B, 256)
         assert L == 256, "Expected 256 latent embeddings per batch."
-
-        # Get the top-k uncertainty indices for each batch
         topk_indices = torch.topk(uncertainty_map, k=top_k, dim=1)[1]  # (B, top_k)
-
-        # Compute (h, w) positions for the 16x16 spatial grid
-        #h = topk_indices // 16  # Compute row indices (B, top_k)
-        #w = topk_indices % 16   # Compute column indices (B, top_k)
-
-        # Create an empty mask (B, 1, 16, 16)
         mask = torch.zeros(B, 256, dtype=torch.bool, device=uncertainty_map.device)
-
-        # Use advanced indexing to set selected positions to True
         mask[torch.arange(B).unsqueeze(1), topk_indices] = True  # Vectorized assignment
         #mask = mask.view(-1, 256)
-        return mask  # Shape: (B, 1, 16, 16)
+        return mask  
     
     
     def forward(self, label_B: torch.LongTensor, x_BLCv_wo_first_l: torch.Tensor) -> torch.Tensor:  # returns logits_BLV

@@ -195,7 +195,7 @@ class VARCalibrator(object):
                     scores = torch.mul(probs_distances_BlV, a)
                     cal_scores = torch.sum(scores, dim = 2)
                 
-                # CPS with scaled logits (shannon entropy as temperature) and cumulative score function
+                # CPS Experimental with scaled logits (shannon entropy as temperature) and cumulative score function
                 if cp_type == 7:
                     # scale with shannon entropy
                     log10 = torch.log10(softmax_BlV)
@@ -211,7 +211,7 @@ class VARCalibrator(object):
                     cal_scores = torch.cumsum(sorted_softmax_BlV, dim=-1)
                     cal_scores = torch.gather(cal_scores, dim=-1, index=position_tc.unsqueeze(-1))
 
-                # CPS with scaled logits (rao entropy as temperature) and cumulative score function
+                # CPS Experimental with scaled logits (rao entropy as temperature) and cumulative score function
                 if cp_type == 8:
                     p_flat = softmax_BlV.reshape(-1, V)  # shape (B*l, V)
                     dp = torch.matmul(p_flat, distances)
@@ -219,7 +219,13 @@ class VARCalibrator(object):
                     rao_entropy = rao_entropy_flat.reshape(B, L).unsqueeze(-1)
                     logits_BlV_emp = logits_BlV / rao_entropy
                     softmax_BlV_emp = torch.softmax(logits_BlV_emp, dim = -1)
-                
+
+                    sorted_softmax_BlV, sorted_indices = torch.sort(softmax_BlV_emp, dim=-1, descending=True)
+                    position_tc = (sorted_indices == true_indcs_expanded)# shape B,l, V
+                    position_tc = torch.argmax(position_tc.to(torch.int64), dim=-1)  # B, l, 1
+                    cal_scores = torch.cumsum(sorted_softmax_BlV, dim=-1)
+                    cal_scores = torch.gather(cal_scores, dim=-1, index=position_tc.unsqueeze(-1))
+
                 # CPS Experimental: Scale the Logits based on expected distance from all other classes
                 if cp_type == 9:
                     p_flat = softmax_BlV.reshape(-1, V)  # shape (B*L, V)
@@ -276,27 +282,27 @@ class VARCalibrator(object):
                     
                     
                 # CPS Experimental: Scale scores based on entropy of top-k logits
-                if cp_type == 3:
-                    _, topk_idxs = distances.topk(100, dim=-1, largest=False) # V, k | B, L, 1
-                    neighbours = topk_idxs[true_indcs_expanded.squeeze(-1)]
-                    mask = torch.zeros_like(softmax_BlV).bool()
-                    mask.scatter_(dim=-1, index=neighbours, value=True)
-                    # Zero out non-top-k entries
-                    softmax_BlV = softmax_BlV * mask
+                # if cp_type == 3:
+                #     _, topk_idxs = distances.topk(100, dim=-1, largest=False) # V, k | B, L, 1
+                #     neighbours = topk_idxs[true_indcs_expanded.squeeze(-1)]
+                #     mask = torch.zeros_like(softmax_BlV).bool()
+                #     mask.scatter_(dim=-1, index=neighbours, value=True)
+                #     # Zero out non-top-k entries
+                #     softmax_BlV = softmax_BlV * mask
 
-                    # ------------- compute entropy of top-k classes
-                    topk_logits = torch.gather(logits_BlV, dim=-1, index=topk_idxs)
-                    topk_softmax = torch.softmax(topk_logits, dim = -1)
-                    log10 = torch.log10(topk_softmax)
-                    torch.nan_to_num_(log10, nan=0)
-                    emp_entropy = (- torch.sum(topk_softmax * log10, dim = -1).unsqueeze(-1)) / np.log10(100)
-                    # --------------
+                #     # ------------- compute entropy of top-k classes
+                #     topk_logits = torch.gather(logits_BlV, dim=-1, index=topk_idxs)
+                #     topk_softmax = torch.softmax(topk_logits, dim = -1)
+                #     log10 = torch.log10(topk_softmax)
+                #     torch.nan_to_num_(log10, nan=0)
+                #     emp_entropy = (- torch.sum(topk_softmax * log10, dim = -1).unsqueeze(-1)) / np.log10(100)
+                #     # --------------
 
-                    sorted_softmax_BlV, sorted_indices = torch.sort(softmax_BlV, dim=-1, descending=True)
-                    position_tc = (sorted_indices == true_indcs_expanded)# shape B,l, V
-                    position_tc = torch.argmax(position_tc.to(torch.int64), dim=-1)  # B, l, 1
-                    cal_scores = torch.cumsum(sorted_softmax_BlV, dim=-1)
-                    cal_scores = torch.gather(cal_scores, dim=-1, index=position_tc.unsqueeze(-1)) * emp_entropy
+                #     sorted_softmax_BlV, sorted_indices = torch.sort(softmax_BlV, dim=-1, descending=True)
+                #     position_tc = (sorted_indices == true_indcs_expanded)# shape B,l, V
+                #     position_tc = torch.argmax(position_tc.to(torch.int64), dim=-1)  # B, l, 1
+                #     cal_scores = torch.cumsum(sorted_softmax_BlV, dim=-1)
+                #     cal_scores = torch.gather(cal_scores, dim=-1, index=position_tc.unsqueeze(-1)) * emp_entropy
 
                 
                 # concat cal_scores for given resolution along batch axis
