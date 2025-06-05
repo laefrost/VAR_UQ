@@ -22,7 +22,7 @@ https://arxiv.org/abs/2411.04852
       - Different types of calibration techniques can be submitted as calibration parameter
 3) Calibration executed in: `calibrator.py`
 4) Functions for generating conformal prediction sets in: `models/var.py`
-      - Specific function for generating images with CPS/CCR (depending on the type of calibration of the calibrated model): 
+      - Specific function for generating images with CPS/CCR (depending on the type of calibration of the calibrated model): `autoregressive_infer_and_uq()`
 5) Helper functions for e.g. calculating the upper/lower entropy can be found in `models/helpers_calib.py`
 6) Example on how to use a calibrated model in `demo_calibrate.ipynb`
 
